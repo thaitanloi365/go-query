@@ -3,19 +3,39 @@ package query
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"math"
 	"reflect"
 	"strings"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"gorm.io/gorm/utils"
 )
 
 type DB interface {
-	GetGorm() *gorm.DB
-	WithGorm(db *gorm.DB) DB
+	Debug() *gorm.DB
+	Model(value interface{}) *gorm.DB
+	Clauses(conds ...clause.Expression) *gorm.DB
+	Table(name string, args ...interface{}) *gorm.DB
+	Distinct(args ...interface{}) *gorm.DB
+	Select(query interface{}, args ...interface{})
+	Omit(columns ...string) *gorm.DB
+	Where(query interface{}, args ...interface{}) *gorm.DB
+	Not(query interface{}, args ...interface{}) *gorm.DB
+	Or(query interface{}, args ...interface{}) *gorm.DB
+	Joins(query string, args ...interface{}) *gorm.DB
+	Group(name string) *gorm.DB
+	Having(query interface{}, args ...interface{}) *gorm.DB
+	Order(value interface{}) *gorm.DB
+	Limit(limit int) *gorm.DB
+	Offset(offset int) *gorm.DB
+	Raw(sql string, values ...interface{}) *gorm.DB
+	Unscoped() *gorm.DB
+	Assign(attrs ...interface{}) *gorm.DB
+	Attrs(attrs ...interface{}) *gorm.DB
+	Preload(query string, args ...interface{}) *gorm.DB
+	Row() *sql.Row
+	Rows() (*sql.Rows, error)
+	Scan(dest interface{}) *gorm.DB
 }
 
 // ExecFunc exec func
@@ -41,30 +61,30 @@ type Pagination struct {
 
 // Builder query config
 type Builder struct {
-	db                DB
-	rawSQLString      string
-	countRawSQLString string
-	limit             int
-	page              int
-	wrapJSON          bool
-	namedWhereValues  map[string]interface{}
-	tx                *gorm.DB
+	db               DB
+	RawSQLString     string
+	limit            int
+	page             int
+	hasWhere         bool
+	whereValues      []interface{}
+	namedWhereValues map[string]interface{}
+	orderBy          string
+	groupBy          string
+	wrapJSON         bool
 }
 
 // New init
-func New(db DB, rawSQL string, countRawSQL ...string) *Builder {
+func New(db DB, rawSQL string) *Builder {
 	var builder = &Builder{
 		db:               db,
-		rawSQLString:     rawSQL,
-		wrapJSON:         false,
+		RawSQLString:     rawSQL,
+		whereValues:      []interface{}{},
 		namedWhereValues: map[string]interface{}{},
-		tx:               db.GetGorm().Session(&gorm.Session{DryRun: true}),
+		hasWhere:         false,
+		orderBy:          "",
+		groupBy:          "",
+		wrapJSON:         false,
 	}
-
-	if len(countRawSQL) > 0 {
-		builder.countRawSQLString = countRawSQL[0]
-	}
-
 	return builder
 }
 
@@ -75,53 +95,43 @@ func (b *Builder) WithWrapJSON(isWrapJSON bool) *Builder {
 }
 
 // PrepareCountSQL prepare statement
-func (b *Builder) count(countSQL *gorm.DB, done chan bool, count *int) {
-	var err = countSQL.Scan(count).Error
-	if err != nil {
-		log.Fatalf("Scan row error: %v", err)
-	}
+func (b *Builder) count(countSQL DB, done chan bool, count *int) {
+	countSQL.Row().Scan(count)
 	done <- true
+}
+
+// WhereNamed where
+func (b *Builder) WhereNamed(key string, value interface{}) *Builder {
+	b.namedWhereValues[key] = value
+	return b
 }
 
 // Where where
 func (b *Builder) Where(query interface{}, args ...interface{}) *Builder {
-	switch value := query.(type) {
-	case map[string]interface{}:
-		b.namedWhereValues = value
-	case map[string]string:
-		for key, v := range value {
-			b.namedWhereValues[key] = v
-		}
-	case sql.NamedArg:
-		b.namedWhereValues[value.Name] = value.Value
-	default:
-		b.tx = b.tx.Where(query, args...)
-
+	if len(args) > 0 {
+		b.whereValues = append(b.whereValues, args...)
 	}
 
-	return b
-}
-
-// Having where
-func (b *Builder) Having(query interface{}, args ...interface{}) *Builder {
-	b.tx.Statement.AddClause(clause.GroupBy{
-		Having: b.tx.Statement.BuildCondition(query, args...),
-	})
+	if b.hasWhere {
+		b.RawSQLString = fmt.Sprintf("%s AND %v", b.RawSQLString, query)
+	} else {
+		b.RawSQLString = fmt.Sprintf("%s WHERE %v", b.RawSQLString, query)
+		b.hasWhere = true
+	}
 	return b
 }
 
 // OrderBy specify order when retrieve records from database
-func (b *Builder) OrderBy(orderBy interface{}) *Builder {
-	b.tx = b.tx.Order(orderBy)
+func (b *Builder) OrderBy(orderBy ...string) *Builder {
+	if len(orderBy) > 0 {
+		b.orderBy = strings.Join(orderBy, ",")
+	}
 	return b
 }
 
 // GroupBy specify the group method on the find
-func (b *Builder) GroupBy(name string) *Builder {
-	fields := strings.FieldsFunc(name, utils.IsValidDBNameChar)
-	b.tx.Statement.AddClause(clause.GroupBy{
-		Columns: []clause.Column{{Name: name, Raw: len(fields) != 1}},
-	})
+func (b *Builder) GroupBy(groupBy string) *Builder {
+	b.groupBy = groupBy
 	return b
 }
 
@@ -144,19 +154,37 @@ func (b *Builder) Page(page int) *Builder {
 }
 
 // Build build
-func (b *Builder) build() (queryString string, countQuery string, vars []interface{}) {
-	queryString = b.rawSQLString
-	countQuery = b.countRawSQLString
-	if countQuery == "" {
-		countQuery = b.rawSQLString
+func (b *Builder) build() (queryString string, countQuery string) {
+	var rawSQLString = b.RawSQLString
+	for key, value := range b.namedWhereValues {
+		switch v := value.(type) {
+		case string:
+			rawSQLString = strings.ReplaceAll(rawSQLString, fmt.Sprintf("@%s", key), fmt.Sprintf("'%v'", value))
+		case []string:
+			var cols = []string{}
+			for _, str := range v {
+				cols = append(cols, fmt.Sprintf("'%s'", str))
+			}
+			rawSQLString = strings.ReplaceAll(rawSQLString, fmt.Sprintf("@%s", key), fmt.Sprintf("%v", strings.Join(cols, ",")))
+		default:
+			rawSQLString = strings.ReplaceAll(rawSQLString, fmt.Sprintf("@%s", key), fmt.Sprintf("%v", value))
+		}
+
 	}
-	b.tx.Statement.Build("WHERE", "GROUP BY", "HAVING")
 
-	countQuery = fmt.Sprintf("SELECT COUNT(1) FROM (%s %s) t", countQuery, b.tx.Statement.SQL.String())
+	queryString = rawSQLString
+	countQuery = rawSQLString
+	if b.groupBy != "" {
+		queryString = fmt.Sprintf("%s GROUP BY %s", queryString, b.groupBy)
+		countQuery = queryString
+	}
 
-	// Build limit, offset clause
-	var limitClause = clause.Limit{
-		Limit: b.limit,
+	if b.orderBy != "" {
+		queryString = fmt.Sprintf("%s ORDER BY %s", queryString, b.orderBy)
+	}
+
+	if b.limit > 0 {
+		queryString = fmt.Sprintf("%s LIMIT %d", queryString, b.limit)
 	}
 
 	if b.page > 0 {
@@ -164,31 +192,14 @@ func (b *Builder) build() (queryString string, countQuery string, vars []interfa
 		if b.page > 1 {
 			offset = (b.page - 1) * b.limit
 		}
-		limitClause.Offset = offset
-	}
-	b.tx.Statement.AddClause(limitClause)
 
-	b.tx.Statement.WriteString(" ")
-	b.tx.Statement.Build("ORDER BY", "LIMIT")
-	queryString = fmt.Sprintf("%s %s", queryString, b.tx.Statement.SQL.String())
-
-	vars = b.tx.Statement.Vars
-
-	for _, vv := range vars {
-		var bindvar = strings.Builder{}
-		b.db.GetGorm().Dialector.BindVarTo(&bindvar, b.tx.Statement, vv)
-		queryString = strings.Replace(queryString, bindvar.String(), "?", 1)
-		countQuery = strings.Replace(countQuery, bindvar.String(), "?", 1)
-
+		queryString = fmt.Sprintf("%s OFFSET %d", queryString, offset)
 	}
 
 	if b.wrapJSON {
 		queryString = fmt.Sprintf(`
-WITH alias AS (
-	%s
-)
-SELECT to_jsonb(row_to_json(alias)) AS alias 
-FROM alias
+		WITH alias AS (%s)
+		SELECT to_jsonb(row_to_json(alias)) AS alias FROM alias
 		`, queryString)
 	}
 
@@ -205,25 +216,20 @@ func (b *Builder) PagingFunc(f ExecFunc) *Pagination {
 	var pagination Pagination
 	var count int
 
-	sqlString, countSQLString, vars := b.build()
-	for key, value := range b.namedWhereValues {
-		vars = append(vars, sql.Named(key, value))
-	}
+	sqlString, countSQLString := b.build()
 
-	var countSQL = b.db.GetGorm().Raw(countSQLString, vars...)
+	var values = []interface{}{}
+	values = append(values, b.whereValues...)
+
+	var countSQL = b.db.Raw(fmt.Sprintf("SELECT COUNT(1) FROM (%s) t", countSQLString), values...)
 	go b.count(countSQL, done, &count)
 
-	result, err := f(b.db, b.db.WithGorm(b.db.GetGorm().Raw(sqlString, vars...)))
+	result, err := f(b.db, b.dbb.db.Raw(sqlString, values...))
 	if err != nil {
-		log.Fatalf("Scan row error: %v", err)
-		return &pagination
+		b.db.CustomLogger.Error(err)
 	}
-
-	if reflect.ValueOf(result).Kind() != reflect.Ptr {
-		panic("Result of PagingFunc must be a pointer")
-	}
-
 	<-done
+	close(done)
 
 	pagination.TotalRecord = count
 	pagination.Records = result
@@ -262,13 +268,12 @@ func (b *Builder) PagingFunc(f ExecFunc) *Pagination {
 
 // ExecFunc exec
 func (b *Builder) ExecFunc(f ExecFunc, dest interface{}) error {
-	sqlString, _, vars := b.build()
+	sqlString, _ := b.build()
 
-	for key, value := range b.namedWhereValues {
-		vars = append(vars, sql.Named(key, value))
-	}
+	var values = []interface{}{}
+	values = append(values, b.whereValues...)
 
-	result, err := f(b.db, b.db.WithGorm(b.db.GetGorm().Raw(sqlString, vars...)))
+	result, err := f(b.db, b.db.WithGorm(b.db.Raw(sqlString, values...)))
 	if err != nil {
 		return err
 	}
@@ -304,10 +309,11 @@ func (b *Builder) ExecFunc(f ExecFunc, dest interface{}) error {
 
 // Scan scan
 func (b *Builder) Scan(dest interface{}) error {
-	sqlString, _, vars := b.build()
+	sqlString, _ := b.build()
 
-	var err = b.db.GetGorm().Raw(sqlString, vars...).Scan(dest).Error
+	var err = b.db.Raw(sqlString, b.whereValues...).Scan(dest).Error
 	if err != nil {
+		b.db.CustomLogger.Error(err)
 		return err
 	}
 
@@ -316,10 +322,11 @@ func (b *Builder) Scan(dest interface{}) error {
 
 // ScanRow scan
 func (b *Builder) ScanRow(dest interface{}) error {
-	sqlString, _, vars := b.build()
+	sqlString, _ := b.build()
 
-	var err = b.db.GetGorm().Raw(sqlString, vars...).Row().Scan(dest)
+	var err = b.db.Raw(sqlString, b.whereValues...).Row().Scan(dest)
 	if err != nil {
+		b.db.CustomLogger.Error(err)
 		return err
 	}
 
